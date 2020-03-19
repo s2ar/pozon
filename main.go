@@ -374,6 +374,35 @@ func grabStep2(ch1 <-chan string, w int, wg *sync.WaitGroup) {
 	fmt.Println("finish: ", w)
 }
 
+func grabStep1(ch1 <-chan string, out chan<- string, w int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for val := range ch1 {
+		//fmt.Println("w ", w, "grabStep1: ", val)
+		err := false
+
+		//err := getProduct(val, w)
+		//if err != nil {
+		val = val + " done"
+		out <- val
+		if false {
+			fmt.Println("w ", w, "grabStep1: ", val, "err: ", err)
+			saveErrorProductToFile(val, w)
+		} else {
+			//fmt.Println("w ", w, "grabStep1: ", val)
+		}
+		runtime.Gosched()
+	}
+	fmt.Println("finish: ", w)
+}
+
+func grabStep1Out(out <-chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for val := range out {
+		fmt.Println("out :", val)
+	}
+	fmt.Println("finish grabStep1Out ")
+}
+
 func getProduct(url string, w int) error {
 
 	file := fmt.Sprintf(fileCsv, w)
@@ -446,6 +475,43 @@ func main() {
 
 	if step == 1 {
 		fmt.Println("Step", step)
+
+		ch0 := make(chan string, 1)
+		out := make(chan string, 1)
+		wg0 := &sync.WaitGroup{}
+
+		go grabStep1Out(out, wg0)
+
+		for i := 0; i < workers; i++ {
+			wg0.Add(1)
+			go grabStep1(ch0, out, i, wg0)
+		}
+
+		lines, err := readLines(fileStartURL)
+		check(err)
+
+		for _, value := range lines {
+			value = strings.TrimSpace(value)
+			ch0 <- value
+		}
+		close(ch0)
+
+		/*for {
+			select {
+			case row := <-out:
+				fmt.Println("end ", row)
+			}
+		}*/
+
+		// for row := range out {
+		// 	fmt.Println("end ", row)
+		// }
+
+		//time.Sleep(time.Millisecond)
+		wg0.Wait()
+
+		os.Exit(1)
+
 		getProductList()
 	} else {
 		fmt.Println("Step", step)
@@ -453,7 +519,7 @@ func main() {
 		ch1 := make(chan string, 1)
 		wg := &sync.WaitGroup{}
 
-		for i := 0; i < 5; i++ {
+		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go grabStep2(ch1, i, wg)
 		}
