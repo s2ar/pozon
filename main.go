@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
@@ -26,13 +27,26 @@ import (
 var (
 	domen        = "https://www.ozon.ru"
 	fileURL      = "products_list.txt"
-	fileCsv      = "products_data_w%d.csv"
+	fileCsv      = "products_data_v2_w%d.csv"
 	fileError    = "products_error_w%d.txt"
+	fileBadURL   = "products_bad_url_w%d.txt"
 	fileStartURL = "catalog_list.txt"
 
 	reportPeriod = 5
-	workers      = 1
+	workers      = 5
 	step         = 2
+
+	acceptLanguageList = []string{
+		"en-US,en;q=0.5",
+		"ru,en-GB;q=0.9,en;q=0.8,zh-CN;q=0.7,zh;q=0.6,en-US;q=0.5,de-AT;q=0.4,de;q=0.3,zh-TW;q=0.2,mt;q=0.1",
+		"ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+	}
+
+	userAgentList = []string{
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Safari/537.36",
+		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:74.0) Gecko/20100101 Firefox/74.0",
+		"Mozilla/5.0 (Windows NT 10.0; rv:68.0) Gecko/20100101 Firefox/68.0",
+	}
 
 	startSсanUrls = []string{}
 )
@@ -55,12 +69,23 @@ type Product struct {
 
 func getDocByURL(url string) (doc *goquery.Document, err error) {
 	url = strings.TrimSpace(url)
-	// Request the HTML page.
-	res, err := http.Get(url)
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	//defer req.Body.Close()
+
+	rand.Seed(time.Now().Unix()) // initialize global pseudo random generator
+	userAgent := userAgentList[rand.Intn(len(userAgentList))]
+	acceptLanguage := acceptLanguageList[rand.Intn(len(acceptLanguageList))]
+
+	req.Header.Add("accept-language", acceptLanguage)
+	req.Header.Add("user-agent", userAgent)
+
+	res, err := http.DefaultClient.Do(req)
+	defer func() { _ = res.Body.Close() }()
+
 	if res.StatusCode != 200 {
 		return nil, fmt.Errorf("status code error: %d %s", res.StatusCode, res.Status)
 		//return nil, errors.New(fmt.Sprintf("status code error: %d %s", res.StatusCode, res.Status))
@@ -71,7 +96,6 @@ func getDocByURL(url string) (doc *goquery.Document, err error) {
 	doc, err = goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
 		return nil, err
-		//log.Fatal(err)
 	}
 	// тормозимся
 	//time.Sleep(100 * time.Millisecond)
@@ -174,7 +198,7 @@ func saveProductListToFile(productList []string) {
 	datawriter.Flush()
 }
 
-func saveErrorProductToFile(product string, w int) {
+func saveErrorProductToFile(fileError string, product string, w int) {
 	file := fmt.Sprintf(fileError, w)
 	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	check(err)
@@ -196,7 +220,6 @@ func requestToDetail(url string) (p Product, err error) {
 
 	r, _ := regexp.Compile("([0-9]+)")
 	p.sku = r.FindString(url)
-
 	url = strings.TrimSpace(url)
 
 	doc, err := getDocByURL(url)
@@ -209,65 +232,45 @@ func requestToDetail(url string) (p Product, err error) {
 		return p, errors.New("Name is empty")
 	}
 
-	//textHTML, _ := doc.Html()
-	//fmt.Println("textHTML", textHTML)
+	p.desc, _ = getDesc(doc.Find("script#state-webDescription-293078-default-1").Text())
+	p.desc = clearText(p.desc)
 
-	p.desc = clearText(doc.Find("div#section-description > div").Text())
+	listCharact, _ := getCharacteristics(doc.Find("script#state-characteristics-293080-default-1").Text())
 
-	//dataCharacteristics := []byte(doc.Find("script#state-characteristics-293080-default-1").Text())
+	for key, val := range listCharact {
+		//fmt.Println(key, val)
 
-	//var character interface{}
-	//json.Unmarshal(dataCharacteristics, &character)
-	//fmt.Printf("unpacked in empty interface:\n%#v\n\n", character)
-	//os.Exit(1)
+		val = clearText(val)
 
-	fmt.Println(doc.Find("script#state-characteristics-293080-default-1").Text())
-	fmt.Println("p.desc", p.desc)
+		if key == "Country" {
+			p.manufacturerCountry = val
+		} else if key == "BruttoWeight" {
+			p.shippingWeight = val
+		} else if key == "Brand" {
+			p.brand = val
+		} else if key == "Consist" { // состав
+			p.composition = val
+		} else if key == "ApplicationMethod" { // способ применения
+			p.modeAppl = val
+		} else if key == "MedIndications" { // показания
+			p.indications = val
+		} else if key == "TDimensions" {
 
-	doc.Find("div#section-characteristics  dl").Each(func(i int, s *goquery.Selection) {
-		propName := s.Find("dt").Text()
-		propBody := s.Find("dd").Text()
-
-		propName = clearText(propName)
-		propBody = clearText(propBody)
-
-		fmt.Println("propName", propName)
-		fmt.Println("propBody", propBody)
-
-		if strings.Index(propName, "Способ применения") == 0 {
-			p.modeAppl = propBody
-		} else if strings.Index(propName, "Показания") == 0 {
-			p.indications = propBody
-		} else if strings.Index(propName, "Состав") == 0 {
-			p.composition = propBody
-		} else if strings.Index(propName, "Размер упаковки") == 0 {
-
-			r, _ := regexp.Compile("([0-9]+).*([0-9]+).*([0-9]+)")
-			matchSize := r.FindStringSubmatch(propBody)
+			r := regexp.MustCompile("([\\d.,]+)")
+			matchSize := r.FindAllString(val, -1)
 
 			for i, sizeItem := range matchSize {
-				if i == 1 {
+				if i == 0 {
 					p.length = sizeItem
-				} else if i == 2 {
+				} else if i == 1 {
 					p.width = sizeItem
-				} else if i == 3 {
+				} else if i == 2 {
 					p.height = sizeItem
 				}
 			}
-
-			fmt.Println(matchSize)
-
-		} else if strings.Index(propName, "Вес в упаковке") == 0 {
-			p.shippingWeight = propBody
-		} else if strings.Index(propName, "Страна-изготовитель") == 0 {
-			p.manufacturerCountry = propBody
-		} else if strings.Index(propName, "Бренд") == 0 {
-			p.brand = propBody
+			//fmt.Println(matchSize)
 		}
-
-		os.Exit(1)
-
-	})
+	}
 	return
 }
 
@@ -381,11 +384,12 @@ func clearText(s string) string {
 func grabStep2(ch1 <-chan string, w int, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for val := range ch1 {
-		fmt.Println("w ", w, "grabStep2: ", val)
+		//fmt.Println("w ", w, "grabStep2: ", val)
 		err := getProduct(val, w)
 		if err != nil {
-			fmt.Println("w ", w, "grabStep2: ", val, "err: ", err)
-			saveErrorProductToFile(val, w)
+			//fmt.Println("w ", w, "grabStep2: ", val, "err: ", err)
+			saveErrorProductToFile(fileError, fmt.Sprintf("%s - %s", val, err), w)
+			saveErrorProductToFile(fileBadURL, val, w)
 		} else {
 			fmt.Println("w ", w, "grabStep2: ", val)
 		}
@@ -445,141 +449,123 @@ func getProduct(url string, w int) error {
 	return nil
 }
 
-// CurKey текущий ключ
-var CurKey string
-var propVal string
+func getCharacteristics(jsonData string) (MapValResult map[string]string, err error) {
 
-// MapValResult  хеш таблица результатов
-var MapValResult = map[string]string{}
+	propVal := ""
+	data := []byte(jsonData)
 
-func main() {
-
-	var jsonStr = `{"topList":false,"canExpand":false,"showLong":true,"withoutTitle":false,"limit":300,"externalDescription":null,"columns":2,"thresholdLength":166,"viewLine":"dotted","disclaimer":"Информация о технических характеристиках, комплекте поставки, стране изготовления, внешнем виде и цвете товара носит справочный характер и основывается на последних доступных к моменту публикации сведениях","title":"Характеристики","anchor":"section-characteristics","characteristics":[{"title":"","short":[{"key":"Type","name":"Тип","values":[{"text":"Кондиционер, ополаскиватель"}]},{"key":"TasteNF","name":"Аромат","values":[{"text":"Цветочный"}]},{"key":"Appointment","name":"Назначение.","values":[{"text":"Для детского белья"},{"text":"Для цветного белья"},{"text":"Для белого белья"},{"text":"Для одежды"}]},{"key":"Features","name":"Особенности применения","values":[{"text":"Концентрат"},{"text":"Гипоаллергенность"},{"text":"Антистатический эффект"}]},{"key":"EditionForm","name":"Форма выпуска","values":[{"text":"Жидкость"}]},{"key":"Country","name":"Страна-изготовитель","values":[{"text":"Германия"}]},{"key":"Article","name":"Артикул","values":[{"text":"830461;830461;830461;830461"}]},{"key":"TDimensions","name":"Размер упаковки (Длина х Ширина х Высота), см","values":[{"text":"12 x 8 x 28"}]},{"key":"LoundryMode","name":"Вид стирки","values":[{"text":"Ручная стирка"},{"text":"Автоматическая"}]},{"key":"BruttoWeight","name":"Вес в упаковке, г","values":[{"text":"1560"}]}]}],"cellTrackingInfo":{"uiMap":{"characteristicsTest":{"type":"ui","title":"Характеристики","elementType":"characteristicsTest","countItems":10,"sku":135027610}}}}`
-
-	data := []byte(jsonStr)
-
+	MapValResult = map[string]string{}
 	// Creating the maps for JSON
-	//m := map[string]interface{}{}
 	m := map[string]interface{}{}
 
 	// Parsing/Unmarshalling JSON encoding/json
-	err := json.Unmarshal(data, &m)
+	err = json.Unmarshal(data, &m)
 
+	// @todo
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-
-	fmt.Println(m)
-	fmt.Println("*****************")
-
 	m1 := m["characteristics"].([]interface{})
-	fmt.Println(m1[0])
-	fmt.Println("=============================")
+	//fmt.Println(m1[0])
+	//fmt.Println("=============================")
 	//fmt.Println(m1[0].(interface{}))
 
 	for _, m2 := range m1 {
-		fmt.Println(m2.(map[string]interface{}))
+		//fmt.Println(m2.(map[string]interface{}))
 		for _, m3 := range m2.(map[string]interface{}) {
-			switch concreteVal := m3.(type) {
+			switch m3.(type) {
 			case []interface{}:
-				//fmt.Println("KEY ", key)
-				fmt.Println(m3.([]interface{}))
+				//fmt.Println(m3.([]interface{}))
 
 				for _, m4 := range m3.([]interface{}) {
-					fmt.Println("==================")
-					fmt.Println("m4: ", m4)
+					//fmt.Println("==================")
+					//fmt.Println("m4: ", m4)
 
-					switch concreteVal := m4.(type) {
+					switch m4.(type) {
 					case map[string]interface{}:
-						//fmt.Println("KEY ", key)
-						//fmt.Println(m4.([]interface{}))
 
 						for key5, m5 := range m4.(map[string]interface{}) {
-							fmt.Println("m5: ", key5, m5)
+							//fmt.Println("m5: ", key5, m5)
 
 							if key5 == "key" {
 								CurKey = fmt.Sprintf("%v", m5)
 							}
 
-							switch concreteVal := m5.(type) {
-							/*
-								case map[string]interface{}:
-									//fmt.Println("KEY ", key)
-									//fmt.Println(m4.([]interface{}))
+							switch m5.(type) {
 
-									for _, m6 := range m5.(map[string]interface{}) {
-										fmt.Println("m6: ", m6)
-
-									}*/
 							case []interface{}:
 								//fmt.Println("Index:", i)
-								fmt.Println(m5.([]interface{}))
+								//fmt.Println(m5.([]interface{}))
 
-								for key6, m6 := range m5.([]interface{}) {
-									fmt.Println("m6: ", m6)
+								for _, m6 := range m5.([]interface{}) {
+									//fmt.Println("m6: ", m6)
 
-									switch concreteVal := m6.(type) {
+									switch m6.(type) {
 									case map[string]interface{}:
 										propVal = ""
-										for _, m7 := range m6.(map[string]interface{}) {
-											propVal += fmt.Sprintf("%v", m7) + " "
-											fmt.Println("m7: ", m7)
+										for key7, m7 := range m6.(map[string]interface{}) {
+
+											if key7 != "text" {
+												continue
+											}
+
+											if m7 != nil {
+												propVal += fmt.Sprintf("%v", m7) + " "
+											}
+											//fmt.Println("m7: ", m7)
 
 										}
 									default:
-										fmt.Println("key6: ", key6, concreteVal)
-
-										//fmt.Println(concreteVal)
+										//fmt.Println("key6: ", key6, concreteVal)
 									}
 
 								}
 
 							default:
-								fmt.Println("key5: ", key5, concreteVal)
-
-								//fmt.Println(concreteVal)
+								//fmt.Println("key5: ", key5, concreteVal)
 							}
-
 						}
 
 					default:
-						fmt.Println(concreteVal)
+						//fmt.Println(concreteVal)
 					}
 
 					// запись разобранного свойства
 					MapValResult[CurKey] = propVal
-
 				}
 
 			default:
-				fmt.Println(concreteVal)
+				//fmt.Println(concreteVal)
 			}
-
-			//fmt.Printf("%T\n", m3)
-			//fmt.Println("m3:", m3)
-			//fmt.Println("m3!!!:", m3.(map[string]string))
-			// for _, m4 := range m3.(map[string]interface{}) {
-			// 	fmt.Println("m4: ", m4)
-			// }
-
-			//os.Exit(1)
 		}
 	}
+	return
+}
 
-	//MapValResult := make(map[string]string)
-	//CurKey := ""
-	//parseMap(m)
+func getDesc(jsonData string) (desc string, err error) {
+	data := []byte(jsonData)
 
-	//fmt.Println(CurKey)
-	fmt.Println(MapValResult)
+	// Creating the maps for JSON
+	m := map[string]interface{}{}
 
-	///var dataChar interface{}
+	// Parsing/Unmarshalling JSON encoding/json
+	err = json.Unmarshal(data, &m)
 
-	//json.Unmarshal(data, dataChar)
+	// @todo
+	if err != nil {
+		return "", err
+	}
 
-	//fmt.Printf("struct:\n\t%#v\n\n", dataChar)
+	desc = fmt.Sprintf("%v", m["richAnnotation"])
+	return
+}
 
-	os.Exit(1)
+// CurKey текущий ключ
+var CurKey string
+
+// MapValResult  хеш таблица результатов
+
+func main() {
 
 	flag.IntVar(&step, "step", step, "шаг 1 - формирование url товаров, шаг 2 - формирование csv данных")
 	flag.IntVar(&workers, "w", workers, "количество потоков")
@@ -619,44 +605,5 @@ func main() {
 		wg.Wait()
 		// сканирование без воркеров
 		//getProductData()
-	}
-}
-
-func parseMap(aMap map[string]interface{}) {
-	for key, val := range aMap {
-		switch concreteVal := val.(type) {
-		case map[string]interface{}:
-			fmt.Println("KEY ", key)
-			parseMap(val.(map[string]interface{}))
-		case []interface{}:
-			fmt.Println("KEY ", key)
-			parseArray(val.([]interface{}))
-		default:
-			if key == "key" {
-				CurKey = fmt.Sprintf("%v", concreteVal)
-			}
-
-			if key == "text" {
-				MapValResult[CurKey] = fmt.Sprintf("%v", concreteVal)
-			}
-
-			fmt.Println(key, "-:-", concreteVal)
-		}
-	}
-}
-
-func parseArray(anArray []interface{}) {
-	for i, val := range anArray {
-		switch concreteVal := val.(type) {
-		case map[string]interface{}:
-			fmt.Println("Index:", i)
-			parseMap(val.(map[string]interface{}))
-		case []interface{}:
-			fmt.Println("Index:", i)
-			parseArray(val.([]interface{}))
-		default:
-			fmt.Println("Index", i, ":", concreteVal)
-
-		}
 	}
 }
