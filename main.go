@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
@@ -25,13 +27,26 @@ import (
 var (
 	domen        = "https://www.ozon.ru"
 	fileURL      = "products_list.txt"
-	fileCsv      = "products_data_w%d.csv"
+	fileCsv      = "products_data_v2_w%d.csv"
 	fileError    = "products_error_w%d.txt"
+	fileBadURL   = "products_bad_url_w%d.txt"
 	fileStartURL = "catalog_list.txt"
 
 	reportPeriod = 5
 	workers      = 5
-	step         = 1
+	step         = 2
+
+	acceptLanguageList = []string{
+		"en-US,en;q=0.5",
+		"ru,en-GB;q=0.9,en;q=0.8,zh-CN;q=0.7,zh;q=0.6,en-US;q=0.5,de-AT;q=0.4,de;q=0.3,zh-TW;q=0.2,mt;q=0.1",
+		"ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+	}
+
+	userAgentList = []string{
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.170 Safari/537.36",
+		"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:74.0) Gecko/20100101 Firefox/74.0",
+		"Mozilla/5.0 (Windows NT 10.0; rv:68.0) Gecko/20100101 Firefox/68.0",
+	}
 
 	startSсanUrls = []string{}
 )
@@ -54,12 +69,23 @@ type Product struct {
 
 func getDocByURL(url string) (doc *goquery.Document, err error) {
 	url = strings.TrimSpace(url)
-	// Request the HTML page.
-	res, err := http.Get(url)
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
+	//defer req.Body.Close()
+
+	rand.Seed(time.Now().Unix()) // initialize global pseudo random generator
+	userAgent := userAgentList[rand.Intn(len(userAgentList))]
+	acceptLanguage := acceptLanguageList[rand.Intn(len(acceptLanguageList))]
+
+	req.Header.Add("accept-language", acceptLanguage)
+	req.Header.Add("user-agent", userAgent)
+
+	res, err := http.DefaultClient.Do(req)
+	defer func() { _ = res.Body.Close() }()
+
 	if res.StatusCode != 200 {
 		return nil, fmt.Errorf("status code error: %d %s", res.StatusCode, res.Status)
 		//return nil, errors.New(fmt.Sprintf("status code error: %d %s", res.StatusCode, res.Status))
@@ -70,7 +96,6 @@ func getDocByURL(url string) (doc *goquery.Document, err error) {
 	doc, err = goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
 		return nil, err
-		//log.Fatal(err)
 	}
 	// тормозимся
 	//time.Sleep(100 * time.Millisecond)
@@ -173,7 +198,7 @@ func saveProductListToFile(productList []string) {
 	datawriter.Flush()
 }
 
-func saveErrorProductToFile(product string, w int) {
+func saveErrorProductToFile(fileError string, product string, w int) {
 	file := fmt.Sprintf(fileError, w)
 	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	check(err)
@@ -195,7 +220,6 @@ func requestToDetail(url string) (p Product, err error) {
 
 	r, _ := regexp.Compile("([0-9]+)")
 	p.sku = r.FindString(url)
-
 	url = strings.TrimSpace(url)
 
 	doc, err := getDocByURL(url)
@@ -208,46 +232,45 @@ func requestToDetail(url string) (p Product, err error) {
 		return p, errors.New("Name is empty")
 	}
 
-	p.desc = clearText(doc.Find("div#section-description > div").Text())
+	p.desc, _ = getDesc(doc.Find("script#state-webDescription-293078-default-1").Text())
+	p.desc = clearText(p.desc)
 
-	doc.Find("div#section-characteristics  dl").Each(func(i int, s *goquery.Selection) {
-		propName := s.Find("dt").Text()
-		propBody := s.Find("dd").Text()
+	listCharact, _ := getCharacteristics(doc.Find("script#state-characteristics-293080-default-1").Text())
 
-		propName = clearText(propName)
-		propBody = clearText(propBody)
+	for key, val := range listCharact {
+		//fmt.Println(key, val)
 
-		//fmt.Println("propName", propName)
-		//fmt.Println("propBody", propBody)
+		val = clearText(val)
 
-		if strings.Index(propName, "Способ применения") == 0 {
-			p.modeAppl = propBody
-		} else if strings.Index(propName, "Показания") == 0 {
-			p.indications = propBody
-		} else if strings.Index(propName, "Состав") == 0 {
-			p.composition = propBody
-		} else if strings.Index(propName, "Размер упаковки") == 0 {
+		if key == "Country" {
+			p.manufacturerCountry = val
+		} else if key == "BruttoWeight" {
+			p.shippingWeight = val
+		} else if key == "Brand" {
+			p.brand = val
+		} else if key == "Consist" { // состав
+			p.composition = val
+		} else if key == "ApplicationMethod" { // способ применения
+			p.modeAppl = val
+		} else if key == "MedIndications" { // показания
+			p.indications = val
+		} else if key == "TDimensions" {
 
-			r, _ := regexp.Compile("([0-9]+).*([0-9]+).*([0-9]+)")
-			matchSize := r.FindStringSubmatch(propBody)
+			r := regexp.MustCompile("([\\d.,]+)")
+			matchSize := r.FindAllString(val, -1)
 
 			for i, sizeItem := range matchSize {
-				if i == 1 {
+				if i == 0 {
 					p.length = sizeItem
-				} else if i == 2 {
+				} else if i == 1 {
 					p.width = sizeItem
-				} else if i == 3 {
+				} else if i == 2 {
 					p.height = sizeItem
 				}
 			}
-		} else if strings.Index(propName, "Вес в упаковке") == 0 {
-			p.shippingWeight = propBody
-		} else if strings.Index(propName, "Страна-изготовитель") == 0 {
-			p.manufacturerCountry = propBody
-		} else if strings.Index(propName, "Бренд") == 0 {
-			p.brand = propBody
+			//fmt.Println(matchSize)
 		}
-	})
+	}
 	return
 }
 
@@ -361,11 +384,12 @@ func clearText(s string) string {
 func grabStep2(ch1 <-chan string, w int, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for val := range ch1 {
-		fmt.Println("w ", w, "grabStep2: ", val)
+		//fmt.Println("w ", w, "grabStep2: ", val)
 		err := getProduct(val, w)
 		if err != nil {
-			fmt.Println("w ", w, "grabStep2: ", val, "err: ", err)
-			saveErrorProductToFile(val, w)
+			//fmt.Println("w ", w, "grabStep2: ", val, "err: ", err)
+			saveErrorProductToFile(fileError, fmt.Sprintf("%s - %s", val, err), w)
+			saveErrorProductToFile(fileBadURL, val, w)
 		} else {
 			fmt.Println("w ", w, "grabStep2: ", val)
 		}
@@ -380,9 +404,6 @@ func getProduct(url string, w int) error {
 
 	// пишем заголовок только в новый файл
 	if _, err := os.Stat(file); os.IsNotExist(err) {
-		if err != nil {
-			return err
-		}
 		productSlice := [][]string{{
 			"sku",
 			"name",
@@ -428,9 +449,123 @@ func getProduct(url string, w int) error {
 	return nil
 }
 
-func main() {
+func getCharacteristics(jsonData string) (MapValResult map[string]string, err error) {
 
-	//os.Exit(1)
+	propVal := ""
+	data := []byte(jsonData)
+
+	MapValResult = map[string]string{}
+	// Creating the maps for JSON
+	m := map[string]interface{}{}
+
+	// Parsing/Unmarshalling JSON encoding/json
+	err = json.Unmarshal(data, &m)
+
+	// @todo
+	if err != nil {
+		return nil, err
+	}
+	m1 := m["characteristics"].([]interface{})
+	//fmt.Println(m1[0])
+	//fmt.Println("=============================")
+	//fmt.Println(m1[0].(interface{}))
+
+	for _, m2 := range m1 {
+		//fmt.Println(m2.(map[string]interface{}))
+		for _, m3 := range m2.(map[string]interface{}) {
+			switch m3.(type) {
+			case []interface{}:
+				//fmt.Println(m3.([]interface{}))
+
+				for _, m4 := range m3.([]interface{}) {
+					//fmt.Println("==================")
+					//fmt.Println("m4: ", m4)
+
+					switch m4.(type) {
+					case map[string]interface{}:
+
+						for key5, m5 := range m4.(map[string]interface{}) {
+							//fmt.Println("m5: ", key5, m5)
+
+							if key5 == "key" {
+								CurKey = fmt.Sprintf("%v", m5)
+							}
+
+							switch m5.(type) {
+
+							case []interface{}:
+								//fmt.Println("Index:", i)
+								//fmt.Println(m5.([]interface{}))
+
+								for _, m6 := range m5.([]interface{}) {
+									//fmt.Println("m6: ", m6)
+
+									switch m6.(type) {
+									case map[string]interface{}:
+										propVal = ""
+										for key7, m7 := range m6.(map[string]interface{}) {
+
+											if key7 != "text" {
+												continue
+											}
+
+											if m7 != nil {
+												propVal += fmt.Sprintf("%v", m7) + " "
+											}
+											//fmt.Println("m7: ", m7)
+
+										}
+									default:
+										//fmt.Println("key6: ", key6, concreteVal)
+									}
+
+								}
+
+							default:
+								//fmt.Println("key5: ", key5, concreteVal)
+							}
+						}
+
+					default:
+						//fmt.Println(concreteVal)
+					}
+
+					// запись разобранного свойства
+					MapValResult[CurKey] = propVal
+				}
+
+			default:
+				//fmt.Println(concreteVal)
+			}
+		}
+	}
+	return
+}
+
+func getDesc(jsonData string) (desc string, err error) {
+	data := []byte(jsonData)
+
+	// Creating the maps for JSON
+	m := map[string]interface{}{}
+
+	// Parsing/Unmarshalling JSON encoding/json
+	err = json.Unmarshal(data, &m)
+
+	// @todo
+	if err != nil {
+		return "", err
+	}
+
+	desc = fmt.Sprintf("%v", m["richAnnotation"])
+	return
+}
+
+// CurKey текущий ключ
+var CurKey string
+
+// MapValResult  хеш таблица результатов
+
+func main() {
 
 	flag.IntVar(&step, "step", step, "шаг 1 - формирование url товаров, шаг 2 - формирование csv данных")
 	flag.IntVar(&workers, "w", workers, "количество потоков")
@@ -453,7 +588,7 @@ func main() {
 		ch1 := make(chan string, 1)
 		wg := &sync.WaitGroup{}
 
-		for i := 0; i < 5; i++ {
+		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go grabStep2(ch1, i, wg)
 		}
